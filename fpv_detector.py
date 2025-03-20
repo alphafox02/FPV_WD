@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
 """
+MIT License
+
+Copyright (c) 2025 Cemaxecuter
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+"""
 fpv_detector.py
-cemaxecuter 2025
 
 Connects to a specified serial port, receives JSON-like messages from an FPV detection sensor,
 enriches them with GPS data from gpsd, and publishes via a ZMQ XPUB socket for better scalability.
@@ -25,6 +48,8 @@ import argparse
 import serial
 import zmq
 from gps3 import gps3
+import sys
+import signal
 
 # Defaults
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
@@ -32,7 +57,7 @@ DEFAULT_BAUD_RATE = 115200
 DEFAULT_ZMQ_PORT = 4020
 GPSD_HOST = "127.0.0.1"
 GPSD_PORT = 2947
-RECONNECT_DELAY = 5  # Seconds
+RECONNECT_DELAY = 5  # seconds
 
 def parse_args():
     """Parses command-line arguments."""
@@ -53,16 +78,21 @@ def parse_args():
 
 def setup_logging(debug: bool):
     """Configures logging."""
-    # Use WARNING level if not in debug mode for minimal logging
     log_level = logging.DEBUG if debug else logging.WARNING
-    logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=log_level,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
 
 def init_gps_connection():
-    """Initialize a persistent gpsd connection (socket + data_stream)."""
+    """Initializes a persistent gpsd connection (socket + data_stream)."""
     gps_socket = gps3.GPSDSocket()
     data_stream = gps3.DataStream()
-    gps_socket.connect(host=GPSD_HOST, port=GPSD_PORT)
-    gps_socket.watch()
+    try:
+        gps_socket.connect(host=GPSD_HOST, port=GPSD_PORT)
+        gps_socket.watch()
+        logging.info("GPS connection established.")
+    except Exception as e:
+        logging.error("Failed to initialize GPS connection: %s", e)
+        gps_socket, data_stream = None, None
     return gps_socket, data_stream
 
 def get_gps_location(gps_socket, data_stream):
@@ -74,101 +104,175 @@ def get_gps_location(gps_socket, data_stream):
             lat = data_stream.TPV.get('lat', 0.0)
             lon = data_stream.TPV.get('lon', 0.0)
             return lat, lon
-    except StopIteration:
-        # No data right now
-        pass
+    except Exception as e:
+        logging.error("Error getting GPS location: %s", e)
     return 0.0, 0.0
 
 def read_serial(serial_port, baud_rate):
-    """Attempts to connect and read from the serial port continuously."""
+    """Continuously attempts to connect and read from the serial port."""
     while True:
         try:
             with serial.Serial(serial_port, baud_rate, timeout=1) as ser:
-                logging.warning(f"Connected to {serial_port} at {baud_rate} baud.")
+                logging.info("Connected to %s at %d baud.", serial_port, baud_rate)
                 while True:
                     line = ser.readline().decode("utf-8", errors="replace").strip()
                     if line:
-                        logging.debug(f"Raw data: {line}")
+                        logging.debug("Raw data: %s", line)
                         yield line
         except serial.SerialException as e:
-            logging.error(f"Serial connection error: {e}. Reconnecting in {RECONNECT_DELAY} seconds...")
+            logging.error("Serial connection error: %s. Reconnecting in %d seconds...", e, RECONNECT_DELAY)
             time.sleep(RECONNECT_DELAY)
+        except Exception as e:
+            logging.exception("Unexpected error while reading serial port: %s", e)
+            time.sleep(RECONNECT_DELAY)
+
+def process_message(data):
+    """
+    Extracts key elements from the message, including source node information.
+    
+    Returns a structured dictionary containing:
+      - source_node: the node ID from which the message originated
+      - message_type: 'nodeMsg' or 'nodeAlert'
+      - status: status string (e.g., 'NEW CONTACT LOCK')
+      - time, rssi, freq, var, data: additional key data if present
+    """
+    try:
+        msg = data.get("msg", {})
+        source = data.get("from", {}).get("node", "unknown")
+        processed = {
+            "source_node": source,
+            "message_type": msg.get("type", ""),
+            "status": msg.get("stat", ""),
+            "time": msg.get("time"),
+            "rssi": msg.get("rssi"),
+            "freq": msg.get("freq"),
+            "var": msg.get("var"),
+            "data": msg.get("data")
+        }
+        return processed
+    except Exception as e:
+        logging.error("Error processing message: %s", e)
+        return {}
+
+def signal_handler(sig, frame):
+    logging.info("Signal %s received, exiting...", sig)
+    sys.exit(0)
 
 def main():
     args = parse_args()
     setup_logging(args.debug)
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    # Initialize GPS if not stationary, or read once if stationary
+    # Initialize GPS connection and cache location if stationary
     gps_socket, data_stream = None, None
     lat_cache, lon_cache = 0.0, 0.0
 
-    # If stationary, fetch GPS coordinates one time only
-    # Otherwise, keep a persistent connection for continuous updates.
     if not args.stationary:
         gps_socket, data_stream = init_gps_connection()
     else:
         gps_socket, data_stream = init_gps_connection()
-        lat_cache, lon_cache = get_gps_location(gps_socket, data_stream)
-        gps_socket.close()
-        gps_socket = None
-        data_stream = None
+        if gps_socket and data_stream:
+            lat_cache, lon_cache = get_gps_location(gps_socket, data_stream)
+            gps_socket.close()
+            gps_socket, data_stream = None, None
+        else:
+            logging.error("GPS initialization failed in stationary mode. Using default coordinates.")
 
-    # Setup ZMQ XPUB socket for multiple subscribers
+    # Setup ZMQ XPUB socket for message publication
     context = zmq.Context()
     zmq_socket = context.socket(zmq.XPUB)
     zmq_socket.setsockopt(zmq.SNDHWM, 1000)  # High-water mark for buffering
-    zmq_socket.setsockopt(zmq.LINGER, 0)     # Ensure clean socket shutdown
-    zmq_socket.bind(f"tcp://0.0.0.0:{args.zmq_port}")
-    logging.warning(f"ZMQ XPUB socket bound to tcp://0.0.0.0:{args.zmq_port}")
+    zmq_socket.setsockopt(zmq.LINGER, 0)      # Ensure clean socket shutdown
+    zmq_endpoint = f"tcp://0.0.0.0:{args.zmq_port}"
+    try:
+        zmq_socket.bind(zmq_endpoint)
+        logging.info("ZMQ XPUB socket bound to %s", zmq_endpoint)
+    except zmq.ZMQError as e:
+        logging.error("Failed to bind ZMQ socket: %s", e)
+        sys.exit(1)
 
     try:
+        # Process and publish messages continuously from the serial port.
         for line in read_serial(args.serial, args.baud):
             try:
-                # Parse incoming JSON-like data
-                data = json.loads(line)
-
-                msg_type = data.get("type", "")
-                if msg_type == "nodeMsg":
-                    logging.warning("Boot message received.")
-                elif msg_type == "nodeAlert":
-                    # Safely fetch the 'stat' field in msg
-                    stat = data.get("msg", {}).get("stat", "")
-                    if "NEW CONTACT LOCK" in stat:
-                        logging.warning("New FPV Drone detected!")
-                    elif "LOCK UPDATE" in stat:
-                        logging.warning("FPV Drone still in view.")
-                    elif "LOST CONTACT LOCK" in stat:
-                        logging.warning("FPV Drone signal lost.")
-                # -----------------------------------------------------
-
-                # Update GPS location if WarDragon is mobile
-                if not args.stationary and gps_socket and data_stream:
-                    current_lat, current_lon = get_gps_location(gps_socket, data_stream)
-                    lat, lon = (current_lat, current_lon)
-                else:
-                    # If stationary, use cached location
-                    lat, lon = (lat_cache, lon_cache)
-
-                data["gps_lat"] = lat
-                data["gps_lon"] = lon
-
-                # Publish the data
-                json_message = json.dumps(data)
-                zmq_socket.send_string(json_message)
-                logging.debug(f"Published: {json_message}")
-
+                raw_data = json.loads(line)
             except json.JSONDecodeError:
-                logging.warning(f"Failed to parse JSON: {line}")
-            except Exception as e:
-                logging.error(f"Unexpected error: {e}")
+                logging.warning("Failed to parse JSON: %s", line)
+                continue
 
+            processed_msg = process_message(raw_data)
+            if not processed_msg:
+                continue
+
+            # Handle message types and log details
+            message_type = processed_msg.get("message_type", "")
+            status = processed_msg.get("status", "")
+            if message_type == "nodeMsg":
+                if status.startswith("NODE_START"):
+                    logging.info("Boot message received from node %s: %s",
+                                 processed_msg["source_node"], status)
+                elif "CALIBRATION COMPLETE" in status:
+                    logging.info("Calibration complete from node %s: %s",
+                                 processed_msg["source_node"], status)
+                else:
+                    logging.debug("nodeMsg from node %s: %s",
+                                  processed_msg["source_node"], status)
+            elif message_type == "nodeAlert":
+                if "NEW CONTACT LOCK" in status:
+                    logging.warning("New FPV Drone detected from node %s!",
+                                    processed_msg["source_node"])
+                elif "LOCK UPDATE" in status:
+                    logging.info("Lock update from node %s.",
+                                 processed_msg["source_node"])
+                elif "LOST CONTACT LOCK" in status:
+                    logging.warning("Lost contact lock from node %s.",
+                                    processed_msg["source_node"])
+                else:
+                    logging.debug("nodeAlert from node %s: %s",
+                                  processed_msg["source_node"], status)
+                if processed_msg.get("rssi") is not None:
+                    logging.debug("RSSI: %s, Frequency: %s",
+                                  processed_msg.get("rssi"), processed_msg.get("freq"))
+
+            # Update GPS location if applicable
+            if not args.stationary and gps_socket and data_stream:
+                current_lat, current_lon = get_gps_location(gps_socket, data_stream)
+                lat, lon = current_lat, current_lon
+            else:
+                lat, lon = lat_cache, lon_cache
+
+            # Attach GPS coordinates to the processed message
+            processed_msg["gps_lat"] = lat
+            processed_msg["gps_lon"] = lon
+
+            # Publish the structured JSON message via ZMQ
+            try:
+                json_message = json.dumps(processed_msg)
+                zmq_socket.send_string(json_message)
+                logging.debug("Published: %s", json_message)
+            except Exception as e:
+                logging.error("Error publishing message via ZMQ: %s", e)
     except KeyboardInterrupt:
-        logging.warning("Shutting down ZMQ server...")
+        logging.info("KeyboardInterrupt received. Shutting down...")
+    except Exception as e:
+        logging.exception("Unexpected error in main loop: %s", e)
     finally:
-        zmq_socket.close()
-        context.term()
+        # Clean up and close resources gracefully
+        try:
+            zmq_socket.close(0)
+            context.term()
+            logging.info("ZMQ socket and context terminated.")
+        except Exception as e:
+            logging.error("Error during ZMQ cleanup: %s", e)
         if gps_socket:
-            gps_socket.close()
+            try:
+                gps_socket.close()
+            except Exception as e:
+                logging.error("Error closing GPS socket: %s", e)
+        logging.info("Shutdown complete.")
 
 if __name__ == "__main__":
     main()
